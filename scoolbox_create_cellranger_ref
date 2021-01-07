@@ -1,0 +1,178 @@
+#!/usr/bin/env python
+
+import argparse
+from datetime import datetime
+import os
+from pathlib import Path
+import shutil
+import subprocess
+
+parser = argparse.ArgumentParser(
+    description='This script will create a cellranger genome reference optionally with reporters'
+)
+
+# optional arguments
+parser.add_argument('-r', metavar='reporter_fasta', type=str, help='path to a fasta with reporter sequences')
+
+# positional arguments
+parser.add_argument('threads', type=str, help='number of threads to run with')
+parser.add_argument('memory', type=str, help='GB of memory to run STAR genome index generatio with')
+parser.add_argument('genome_name', type=str, help='name of the reference to create')
+parser.add_argument('genome_fasta', type=str, help='path to genome fasta file')
+parser.add_argument('annotation_gtf', type=str, help='path to gtf annotation file')
+
+args = parser.parse_args()
+
+# parse and validate inputs
+int_resources = dict()
+str_resources = dict()
+path_resources = dict()
+
+path_resources['reporter_fasta'] = args.r
+if args.r is not None:
+    path_resources['reporter_fasta'] = Path(args.r)
+
+int_resources['threads'] = args.threads
+int_resources['memory'] = args.memory
+
+str_resources['genome_name'] = args.genome_name
+
+path_resources['genome_fasta'] = Path(args.genome_fasta)
+path_resources['annotation_gtf'] = Path(args.annotation_gtf)
+
+# make sure the supplied resources exist
+if path_resources['reporter_fasta'] is not None:
+    if not path_resources['reporter_fasta'].exists():
+        reporter_fasta = path_resources['reporter_fasta']
+        raise RuntimeError(f'reporter fasta doesn\'t exist, {reporter_fasta}')
+
+# make sure the supplied path resources exist
+for key in ('genome_fasta', 'annotation_gtf'):
+    path = path_resources[key]
+    if not path.exists():
+        raise RuntimeError(f'{key} does not exist, {path}')
+
+# make sure the passed ints pass as integers
+for int_resource in int_resources:
+
+    try:
+        int(int_resources[int_resource])
+
+    except ValueError:
+        arg = int_resources[int_resource]
+        raise ValueError(f'{int_resource} cannot be parsed as an integer, {arg}')
+
+# make a temp dir
+temp_dir = Path(f'temp_{str(datetime.now().timestamp())}')
+
+while temp_dir.exists():
+
+    temp_dir = Path(f'temp_{str(datetime.now().timestamp())}_1')
+
+temp_dir.mkdir(exist_ok=False)
+
+# create the genome ref with any passed reporters
+if path_resources['reporter_fasta'] is not None:
+
+    # grab each reporter from the reporter file
+    reporters = dict()
+    with open(path_resources['reporter_fasta'], 'r') as rf:
+
+        lines = rf.readlines()
+
+        reporter = None
+        for line in lines:
+
+            line = line.strip()
+
+            if line == '':
+                continue
+
+            if line[0] == '>':
+                reporter = line[1:].strip().split()[0]
+                reporters[reporter] = []
+
+            else:
+                reporters[reporter].append(line)
+
+    # concatentate the sequences
+    for reporter in reporters:
+        reporters[reporter] = ''.join(reporters[reporter]).upper()
+
+    # create the reporter annotation entries
+    temp_reporter_gtf = os.path.join(temp_dir, 'reporters.gtf')
+    with open(temp_reporter_gtf, 'w') as ofh:
+        for reporter in reporters:
+
+            sequence = reporters[reporter]
+
+            line_elements = [reporter,
+                             'scac_cumc',
+                             'gene',
+                             '1',
+                             str(len(sequence)),
+                             '.',
+                             '+',
+                             '.']
+
+            reporter_string = '\"' + reporter + '\"'
+
+            gene_line_elems = line_elements.copy()
+            gene_line_elems[2] = 'gene'
+            gene_line_elems.append('; '.join([' '.join(('gene_id', reporter_string)),
+                                              ' '.join(('gene_name', reporter_string)),
+                                              ' '.join(('gene_biotype', '\"reporter\"'))]))
+
+            transcript_line_elems = line_elements.copy()
+            transcript_line_elems[2] = 'transcript'
+            transcript_line_elems.append('; '.join([' '.join(('gene_id', reporter_string)),
+                                                    ' '.join(('gene_name', reporter_string)),
+                                                    ' '.join(('gene_biotype', '\"reporter\"')),
+                                                    ' '.join(('transcript_id', reporter_string))]))
+
+            exon_line_elems = line_elements.copy()
+            exon_line_elems[2] = 'exon'
+            exon_line_elems.append('; '.join([' '.join(('gene_id', reporter_string)),
+                                              ' '.join(('gene_name', reporter_string)),
+                                              ' '.join(('gene_biotype', '\"reporter\"')),
+                                              ' '.join(('transcript_id', reporter_string))]))
+
+            gene_line = '\t'.join(gene_line_elems) + ';'
+            transcript_line = '\t'.join(transcript_line_elems) + ';'
+            exon_line = '\t'.join(exon_line_elems) + ';'
+
+            ofh.write(gene_line + '\n')
+            ofh.write(transcript_line + '\n')
+            ofh.write(exon_line + '\n')
+
+    # concatentate the reference fasta and gtf with the reporter entries in the temp dir
+    temp_genome_path = Path(os.path.join(temp_dir, path_resources['genome_fasta'].name))
+    shutil.copy(path_resources['genome_fasta'], temp_genome_path)
+    path_resources['genome_fasta'] = temp_genome_path
+
+    with open(path_resources['genome_fasta'], 'ab') as ofh:
+        with open(path_resources['reporter_fasta'], 'rb') as ifh:
+            shutil.copyfileobj(ifh, ofh, 1024*1024*10)
+
+    temp_gtf_path = Path(os.path.join(temp_dir, path_resources['annotation_gtf'].name))
+    shutil.copy(path_resources['annotation_gtf'], temp_gtf_path)
+    path_resources['annotation_gtf'] = temp_gtf_path
+
+    with open(path_resources['annotation_gtf'], 'ab') as ofh:
+        with open(temp_reporter_gtf, 'rb') as ifh:
+            shutil.copyfileobj(ifh, ofh, 1024*1024*10)
+
+cmd_string_elems = [
+    'cellranger mkref',
+    '='.join(('--genome', str_resources['genome_name'])),
+    '='.join(('--fasta', str(path_resources['genome_fasta']))),
+    '='.join(('--genes', str(path_resources['annotation_gtf']))),
+    '='.join(('--nthreads', int_resources['threads'])),
+    '='.join(('--memgb', int_resources['memory']))
+]
+
+cmd_string = ' '.join(cmd_string_elems)
+
+subprocess.run(cmd_string, shell=True)
+
+
